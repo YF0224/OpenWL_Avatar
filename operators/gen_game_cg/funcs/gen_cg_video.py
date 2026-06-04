@@ -1,9 +1,29 @@
 """
 gen_cg_video.py — Build LTX keyframes from storyboard and run ONE generation.
 
-Layout: each shot's image is pinned at its cumulative frame index. The first
-shot at frame 0, the last shot at frame (total-1). LTX interpolates everything
-in between as one continuous take (no cuts, no concat).
+Storyboard schema (timing-aware):
+    {
+        "video_prompt":  "<global cinematic narrative>",
+        "duration_sec":  <total video length, optional — defaults to last keyframe time>,
+        "shots": [
+            {
+                "shot_id":     0,
+                "image_prompt": "...",
+                "time_sec":    0.0,        # WHEN this keyframe appears (seconds)
+                "strength":    0.9,        # optional, default 1.0 for first/last, 0.9 otherwise
+                # OR you can use the legacy fields:
+                "frame_idx":   0,          # absolute frame index (wins over time_sec)
+                "duration_sec": 1.0,       # back-compat: per-shot duration → cumulative time
+                ...
+            },
+            ...
+        ]
+    }
+
+Resolution priority for each shot's frame position:
+    1. shot["frame_idx"]                    — explicit frame index
+    2. shot["time_sec"] * frame_rate        — explicit time in seconds
+    3. cumulative shot["duration_sec"]      — legacy fallback
 """
 
 from typing import Optional, List
@@ -13,50 +33,64 @@ from ltx_pipelines.utils.args import ImageConditioningInput
 from models.gen_video.ltx import LTXModel, snap_frames, DEFAULT_FPS
 
 
-def _build_keyframes(shots: list, shot_images: List[str],
+def _resolve_positions(shots: list, frame_rate: float) -> List[int]:
+    """
+    Resolve each shot's frame_idx using the priority:
+        frame_idx > time_sec*frame_rate > cumulative duration_sec.
+    """
+    positions: List[int] = []
+    cum_seconds = 0.0
+    for i, shot in enumerate(shots):
+        if "frame_idx" in shot:
+            positions.append(int(shot["frame_idx"]))
+        elif "time_sec" in shot:
+            positions.append(max(0, round(float(shot["time_sec"]) * frame_rate)))
+        else:
+            # Legacy: cumulative duration_sec → start of next shot
+            if i == 0:
+                positions.append(0)
+            else:
+                positions.append(max(0, round(cum_seconds * frame_rate)))
+            cum_seconds += float(shot.get("duration_sec", 3.0))
+    return positions
+
+
+def _resolve_total_frames(storyboard: dict, shots: list,
+                          positions: List[int], frame_rate: float) -> int:
+    """Resolve total num_frames in this priority:
+        storyboard["num_frames"] > storyboard["duration_sec"]*fps >
+        last shot frame_idx + 1, or last cumulative duration.
+    """
+    if "num_frames" in storyboard:
+        return snap_frames(int(storyboard["num_frames"]))
+    if "duration_sec" in storyboard:
+        return snap_frames(max(9, round(float(storyboard["duration_sec"]) * frame_rate)))
+
+    # Try sum of per-shot duration_sec (legacy)
+    if all("duration_sec" in s for s in shots):
+        total_sec = sum(float(s["duration_sec"]) for s in shots)
+        return snap_frames(max(9, round(total_sec * frame_rate)))
+
+    # Fallback: last keyframe position + 1 second of tail
+    last = (max(positions) if positions else 0) + int(round(frame_rate))
+    return snap_frames(max(9, last))
+
+
+def _build_keyframes(storyboard: dict, shot_images: List[str],
                      frame_rate: float) -> tuple:
-    """
-    Build (keyframes, total_num_frames) from storyboard shots.
-
-    Per-shot overrides supported in storyboard JSON:
-      - frame_idx: absolute frame position for this keyframe (overrides default)
-      - strength:  ImageConditioningInput strength (overrides default)
-
-    Default layout: each shot's image is pinned at its cumulative frame index
-    based on `duration_sec`; boundary frames are shared between consecutive shots.
-    Default strength: 1.0 for first/last anchor, 0.9 for intermediate keyframes.
-    """
+    """Build (keyframes, total_num_frames) from a timing-aware storyboard."""
+    shots = storyboard.get("shots", [])
     if len(shots) != len(shot_images):
         raise ValueError(f"{len(shots)} shots but {len(shot_images)} images.")
 
-    per_shot_frames = [
-        snap_frames(max(9, round(float(s.get("duration_sec", 3.0)) * frame_rate)))
-        for s in shots
-    ]
+    positions = _resolve_positions(shots, frame_rate)
+    total = _resolve_total_frames(storyboard, shots, positions, frame_rate)
 
-    if len(shots) == 1:
-        total = per_shot_frames[0]
-        default_positions = [0]
-    else:
-        cum = 0
-        default_positions = [0]
-        for n in per_shot_frames[:-1]:
-            cum += n - 1
-            default_positions.append(cum)
-        total = snap_frames(cum + per_shot_frames[-1])
-        default_positions[-1] = total - 1
+    # Clamp positions into [0, total-1]
+    positions = [max(0, min(p, total - 1)) for p in positions]
 
-    # Allow shots to override frame_idx; recompute total to cover any larger override
-    final_positions = []
-    for shot, default_idx in zip(shots, default_positions):
-        idx = int(shot.get("frame_idx", default_idx))
-        final_positions.append(idx)
-    total = max(total, max(final_positions) + 1)
-    total = snap_frames(total)
-
-    # Build keyframes with per-shot strength override
     keyframes = []
-    for i, (shot, img, idx) in enumerate(zip(shots, shot_images, final_positions)):
+    for i, (shot, img, idx) in enumerate(zip(shots, shot_images, positions)):
         is_anchor = (i == 0) or (i == len(shots) - 1)
         default_strength = 1.0 if is_anchor else 0.9
         strength = float(shot.get("strength", default_strength))
@@ -77,18 +111,9 @@ def gen_cg_video(
     negative_prompt: Optional[str] = None,
     seed: int = 42,
 ) -> str:
-    """
-    Generate the entire CG video in ONE LTX call.
-
-    Args:
-        storyboard:  {"video_prompt": str, "shots": [...]}.
-        shot_images: List of keyframe image paths, one per shot.
-        model:       Loaded LTXModel.
-    """
-    shots         = storyboard.get("shots", [])
+    """Generate the entire CG video in ONE LTX call."""
     global_prompt = storyboard.get("video_prompt", "")
-
-    keyframes, num_frames = _build_keyframes(shots, shot_images, frame_rate)
+    keyframes, num_frames = _build_keyframes(storyboard, shot_images, frame_rate)
 
     return model.generate(
         prompt=global_prompt,

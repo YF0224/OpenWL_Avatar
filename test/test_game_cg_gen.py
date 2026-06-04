@@ -30,7 +30,8 @@ if __name__ == "__main__":
     print(f"Storyboard: {len(shots)} shots")
     print(f"  Global video_prompt: {storyboard.get('video_prompt', '')[:80]}...")
     for s, p in zip(shots, shot_images):
-        print(f"  Shot {s['shot_id']}: {s['duration_sec']}s  {p}")
+        t = s.get("time_sec", s.get("frame_idx", "?"))
+        print(f"  Shot {s['shot_id']}: t={t}  {p}")
 
     final = op.gen_cg_video(storyboard, shot_images, output_path="output/luffy_cg.mp4")
     print(f"\n✅ Final CG: {final}")
